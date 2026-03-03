@@ -30,7 +30,6 @@ class BluetoothScoService : Service() {
 
         private const val SCO_RETRY_DELAY_MS = 2000L
         private const val SCO_MAX_RETRIES = 5
-        private const val STOP_SCO_DELAY_MS = 600L
     }
 
     private lateinit var audioManager: AudioManager
@@ -41,10 +40,8 @@ class BluetoothScoService : Service() {
     private var isRunning = false
     private var scoRetryCount = 0
     private var connectedDeviceName = "Unknown Device"
-    private var isScoOn = false
     private var isRecording = false
 
-    // ─── Recording Detection ──────────────────────────────────────────────────
     private val recordingCallback = object : AudioManager.AudioRecordingCallback() {
         override fun onRecordingConfigChanged(configs: MutableList<AudioRecordingConfiguration>) {
             if (!isRunning) return
@@ -52,36 +49,37 @@ class BluetoothScoService : Service() {
             isRecording = configs.isNotEmpty()
 
             if (isRecording && !wasRecording) {
-                Log.d(TAG, "Recording STARTED — enabling SCO mic")
-                handler.removeCallbacksAndMessages(null)
-                enableSco()
+                Log.d(TAG, "Recording STARTED — switching to IN_COMMUNICATION")
+                audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
+                updateNotification("🔴 Recording with BT Mic – $connectedDeviceName")
             } else if (!isRecording && wasRecording) {
-                Log.d(TAG, "Recording STOPPED — disabling SCO")
-                handler.removeCallbacksAndMessages(null)
-                handler.postDelayed({ disableSco() }, STOP_SCO_DELAY_MS)
+                Log.d(TAG, "Recording STOPPED — switching to MODE_NORMAL")
+                audioManager.mode = AudioManager.MODE_NORMAL
+                updateNotification("BT Mic Ready – $connectedDeviceName")
             }
         }
     }
 
-    // ─── SCO State Receiver ───────────────────────────────────────────────────
     private val scoReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
             val state = intent.getIntExtra(AudioManager.EXTRA_SCO_AUDIO_STATE, -1)
             Log.d(TAG, "SCO state: $state")
             when (state) {
                 AudioManager.SCO_AUDIO_STATE_CONNECTED -> {
-                    isScoOn = true
                     scoRetryCount = 0
                     audioManager.isMicrophoneMute = false
-                    Log.d(TAG, "SCO connected — BT mic live")
-                    updateNotification("🔴 Recording with BT Mic – $connectedDeviceName")
+                    isRunning = true
+                    audioManager.mode = AudioManager.MODE_NORMAL
+                    Log.d(TAG, "SCO connected — BT mic ready, output in NORMAL mode")
+                    broadcastState(STATE_ACTIVE)
+                    updateNotification("BT Mic Ready – $connectedDeviceName")
                 }
                 AudioManager.SCO_AUDIO_STATE_DISCONNECTED -> {
-                    isScoOn = false
-                    if (isRunning && isRecording) {
+                    Log.d(TAG, "SCO disconnected")
+                    if (isRunning) {
                         if (scoRetryCount < SCO_MAX_RETRIES) {
                             scoRetryCount++
-                            handler.postDelayed({ enableSco() }, SCO_RETRY_DELAY_MS)
+                            handler.postDelayed({ startSco() }, SCO_RETRY_DELAY_MS)
                         } else {
                             broadcastState(STATE_FAILED)
                             stopSelf()
@@ -89,25 +87,17 @@ class BluetoothScoService : Service() {
                     }
                 }
                 AudioManager.SCO_AUDIO_STATE_ERROR -> {
-                    isScoOn = false
-                    if (isRunning && isRecording) {
-                        broadcastState(STATE_FAILED); stopSelf()
-                    }
+                    if (isRunning) { broadcastState(STATE_FAILED); stopSelf() }
                 }
             }
         }
     }
 
-    // ─── Bluetooth Receiver ───────────────────────────────────────────────────
     private val bluetoothReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
             when (intent.action) {
                 BluetoothDevice.ACTION_ACL_DISCONNECTED -> {
-                    if (isRunning) {
-                        Log.d(TAG, "BT disconnected — stopping service")
-                        broadcastState(STATE_BT_DISCONNECTED)
-                        stopSelf()
-                    }
+                    if (isRunning) { broadcastState(STATE_BT_DISCONNECTED); stopSelf() }
                 }
                 BluetoothHeadset.ACTION_CONNECTION_STATE_CHANGED -> {
                     val st = intent.getIntExtra(BluetoothProfile.EXTRA_STATE, -1)
@@ -119,7 +109,6 @@ class BluetoothScoService : Service() {
         }
     }
 
-    // ─── Lifecycle ────────────────────────────────────────────────────────────
     override fun onCreate() {
         super.onCreate()
         audioManager = getSystemService(AUDIO_SERVICE) as AudioManager
@@ -138,20 +127,9 @@ class BluetoothScoService : Service() {
         when (intent?.action) {
             ACTION_START, ACTION_BT_CONNECTED -> {
                 connectedDeviceName = getConnectedDeviceName()
-                isRunning = true
-                startForeground(NOTIFICATION_ID, buildNotification("BT Mic Ready – $connectedDeviceName"))
-                broadcastState(STATE_ACTIVE)
-
-                // Pre-warm SCO immediately so it's ready when recording starts
-                // This eliminates the 300ms delay on first record press
-                prewarmSco()
-
-                // Also check if already recording right now
-                val currentlyRecording = audioManager.activeRecordingConfigurations.isNotEmpty()
-                if (currentlyRecording) {
-                    isRecording = true
-                    enableSco()
-                }
+                startForeground(NOTIFICATION_ID, buildNotification("Connecting BT Mic…"))
+                broadcastState(STATE_CONNECTING)
+                startSco()
             }
             ACTION_STOP -> stopSelf()
         }
@@ -164,7 +142,7 @@ class BluetoothScoService : Service() {
         isRecording = false
         handler.removeCallbacksAndMessages(null)
         audioManager.unregisterAudioRecordingCallback(recordingCallback)
-        disableSco()
+        stopSco()
         safeUnregister(scoReceiver)
         safeUnregister(bluetoothReceiver)
         releaseWakeLock()
@@ -173,61 +151,32 @@ class BluetoothScoService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
-    // ─── SCO Management ───────────────────────────────────────────────────────
-
-    /**
-     * PRE-WARM: Start SCO immediately when service starts, then stop it
-     * after 2 seconds. This establishes the BT HFP connection in advance
-     * so when recording actually starts, SCO connects near-instantly
-     * instead of waiting 200-400ms for the initial BT profile negotiation.
-     */
-    private fun prewarmSco() {
-        Log.d(TAG, "Pre-warming SCO connection")
+    private fun startSco() {
         try {
-            audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
-            audioManager.isBluetoothScoOn = true
-            audioManager.startBluetoothSco()
-            // Let it connect then immediately release back to normal
-            // The BT stack stays "warm" and reconnects much faster next time
-            handler.postDelayed({
-                if (isRunning && !isRecording) {
-                    Log.d(TAG, "Pre-warm done — releasing SCO, back to normal audio")
-                    disableSco()
-                }
-            }, 2000)
-        } catch (e: Exception) {
-            Log.e(TAG, "Prewarm error: ${e.message}")
-        }
-    }
-
-    private fun enableSco() {
-        try {
-            Log.d(TAG, "Enabling SCO for BT mic")
+            Log.d(TAG, "Starting permanent SCO")
             audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
             audioManager.isSpeakerphoneOn = false
             audioManager.isBluetoothScoOn = true
             audioManager.startBluetoothSco()
         } catch (e: Exception) {
-            Log.e(TAG, "enableSco error: ${e.message}")
+            Log.e(TAG, "startSco error: ${e.message}")
+            broadcastState(STATE_FAILED)
+            stopSelf()
         }
     }
 
     @Suppress("DEPRECATION")
-    private fun disableSco() {
+    private fun stopSco() {
         try {
-            Log.d(TAG, "Disabling SCO — restoring normal audio")
             audioManager.stopBluetoothSco()
             audioManager.isBluetoothScoOn = false
             audioManager.isSpeakerphoneOn = false
             audioManager.mode = AudioManager.MODE_NORMAL
-            isScoOn = false
-            if (isRunning) updateNotification("BT Mic Ready – $connectedDeviceName")
         } catch (e: Exception) {
-            Log.e(TAG, "disableSco error: ${e.message}")
+            Log.e(TAG, "stopSco error: ${e.message}")
         }
     }
 
-    // ─── Helpers ──────────────────────────────────────────────────────────────
     private fun getConnectedDeviceName(): String {
         return try {
             @Suppress("MissingPermission")
