@@ -49,8 +49,20 @@ class BluetoothScoService : Service() {
             isRecording = configs.isNotEmpty()
 
             if (isRecording && !wasRecording) {
-                Log.d(TAG, "Recording STARTED — switching to IN_COMMUNICATION")
-                audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
+                // Camera apps use CAMCORDER/VIDEO_RECORD audio source and conflict
+                // with MODE_IN_COMMUNICATION on Samsung — keep MODE_NORMAL for them.
+                // SCO mic still captures audio correctly in MODE_NORMAL for video.
+                val isCameraRecording = configs.any { config ->
+                    config.audioSource == android.media.MediaRecorder.AudioSource.CAMCORDER ||
+                    config.audioSource == android.media.MediaRecorder.AudioSource.VIDEO_RECORD
+                }
+                if (isCameraRecording) {
+                    Log.d(TAG, "Camera recording — keeping MODE_NORMAL")
+                    audioManager.mode = AudioManager.MODE_NORMAL
+                } else {
+                    Log.d(TAG, "Recording STARTED — switching to IN_COMMUNICATION")
+                    audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
+                }
                 updateNotification("🔴 Recording with BT Mic – $connectedDeviceName")
             } else if (!isRecording && wasRecording) {
                 Log.d(TAG, "Recording STOPPED — switching to MODE_NORMAL")
