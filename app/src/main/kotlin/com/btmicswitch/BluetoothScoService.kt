@@ -53,8 +53,7 @@ class BluetoothScoService : Service() {
                 // with MODE_IN_COMMUNICATION on Samsung — keep MODE_NORMAL for them.
                 // SCO mic still captures audio correctly in MODE_NORMAL for video.
                 val isCameraRecording = configs.any { config ->
-                    config.audioSource == android.media.MediaRecorder.AudioSource.CAMCORDER ||
-                    config.audioSource == android.media.MediaRecorder.AudioSource.VIDEO_RECORD
+                    config.audioSource == android.media.MediaRecorder.AudioSource.CAMCORDER
                 }
                 if (isCameraRecording) {
                     Log.d(TAG, "Camera recording — keeping MODE_NORMAL")
